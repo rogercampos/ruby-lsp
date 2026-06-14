@@ -117,10 +117,15 @@ module RubyIndexer
     def test_indexable_uris_grouped_by_cache_key
       grouped = @config.indexable_uris_grouped_by_cache_key
 
-      # The project's own files and default gems are grouped under the `nil` key
+      # The project's own files are grouped under the `nil` key and default gems are no longer there
       non_cached_paths = grouped[nil].map(&:full_path)
-      assert_includes(non_cached_paths, "#{RbConfig::CONFIG["rubylibdir"]}/pathname.rb")
       assert(non_cached_paths.any? { |path| path.start_with?(File.join(Dir.pwd, "lib")) })
+      refute_includes(non_cached_paths, "#{RbConfig::CONFIG["rubylibdir"]}/pathname.rb")
+
+      # Default gems are grouped under a `name-ruby_version` cache key
+      pathname_key = "pathname-#{RUBY_VERSION}"
+      assert_includes(grouped.keys, pathname_key)
+      assert_includes(grouped.fetch(pathname_key).map(&:full_path), "#{RbConfig::CONFIG["rubylibdir"]}/pathname.rb")
 
       # Bundled gems are grouped under a `name-version` cache key
       prism_spec = Gem::Specification.find_by_name("prism")

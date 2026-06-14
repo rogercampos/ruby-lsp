@@ -60,11 +60,11 @@ module RubyIndexer
       indexable_uris_grouped_by_cache_key.values.flatten
     end
 
-    # Returns the URIs that should be indexed, grouped by a cache key. URIs that should not be cached (the project's own
-    # files and default gems, which change frequently or are tied to the Ruby version) are grouped under the `nil` key.
-    # Each bundled gem's URIs are grouped under a `"<name>-<version>"` key so that the index entries produced from those
-    # files can be cached on disk and reused across server starts, since a gem's files only change when its version
-    # changes
+    # Returns the URIs that should be indexed, grouped by a cache key. The project's own files, which change frequently,
+    # are grouped under the `nil` key and never cached. Each bundled gem's URIs are grouped under a `"<name>-<version>"`
+    # key and each default gem's URIs under a `"<name>-<ruby_version>"` key, so that the index entries produced from
+    # those files can be cached on disk and reused across server starts, since a gem's files only change when its
+    # version (or the Ruby version, for default gems) changes
     #: -> Hash[String?, Array[URI::Generic]]
     def indexable_uris_grouped_by_cache_key
       excluded_gems = @excluded_gems - @included_gems
@@ -110,7 +110,21 @@ module RubyIndexer
         excluded_patterns.any? { |pattern| File.fnmatch?(pattern, path, flags) }
       end
 
-      # Add default gems to the list of files to be indexed
+      uris.uniq!(&:to_s)
+
+      # The project's own files are never cached because they change frequently. They are grouped under the `nil` key
+      grouped_uris = { nil => uris } #: Hash[String?, Array[URI::Generic]]
+
+      # Keep track of every URI we've already grouped so that the same file never ends up in more than one group. This
+      # preserves the previous de-duplication behavior where the project's files (added first) take precedence over a
+      # gem's installed files, which matters when BUNDLE_PATH points to a directory inside the project
+      seen = {} #: Hash[String, bool]
+      uris.each { |uri| seen[uri.to_s] = true }
+
+      # Add default gems, grouped per gem so that their entries can be cached. Default gems ship with Ruby and only
+      # change when the Ruby version changes, so we key them by `<name>-<ruby_version>`. The cache's version header also
+      # guards against Ruby version changes, but including the version in the key allows stale entries to be pruned
+      # after an upgrade
       Dir.glob(File.join(RbConfig::CONFIG["rubylibdir"], "*")).each do |default_path|
         # The default_path might be a Ruby file or a folder with the gem's name. For example:
         #   bundler/
@@ -134,29 +148,32 @@ module RubyIndexer
           true
         end
 
-        if pathname.directory?
+        default_uris = if pathname.directory?
           # If the default_path is a directory, we index all the Ruby files in it
-          uris.concat(
-            Dir.glob(File.join(default_path, "**", "*.rb"), File::FNM_PATHNAME | File::FNM_EXTGLOB).map! do |path|
-              URI::Generic.from_path(path: path, load_path_entry: RbConfig::CONFIG["rubylibdir"])
-            end,
-          )
+          Dir.glob(File.join(default_path, "**", "*.rb"), File::FNM_PATHNAME | File::FNM_EXTGLOB).map! do |path|
+            URI::Generic.from_path(path: path, load_path_entry: RbConfig::CONFIG["rubylibdir"])
+          end
         elsif pathname.extname == ".rb"
           # If the default_path is a Ruby file, we index it
-          uris << URI::Generic.from_path(path: default_path, load_path_entry: RbConfig::CONFIG["rubylibdir"])
+          [URI::Generic.from_path(path: default_path, load_path_entry: RbConfig::CONFIG["rubylibdir"])]
+        else
+          []
+        end #: Array[URI::Generic]
+
+        # The same default gem can appear both as a file and a directory (e.g. `psych.rb` and `psych/`). They share the
+        # same cache key so that all of the gem's entries live in a single cache file
+        default_uris.reject! do |uri|
+          key = uri.to_s
+          next true if seen[key]
+
+          seen[key] = true
+          false
         end
+
+        next if default_uris.empty?
+
+        (grouped_uris["#{short_name}-#{RUBY_VERSION}"] ||= []).concat(default_uris)
       end
-
-      uris.uniq!(&:to_s)
-
-      # The project's own files and default gems are not cached. They are grouped under the `nil` key
-      grouped_uris = { nil => uris } #: Hash[String?, Array[URI::Generic]]
-
-      # Keep track of every URI we've already grouped so that the same file never ends up in more than one group. This
-      # preserves the previous de-duplication behavior where the project's files (added first) take precedence over a
-      # gem's installed files, which matters when BUNDLE_PATH points to a directory inside the project
-      seen = {} #: Hash[String, bool]
-      uris.each { |uri| seen[uri.to_s] = true }
 
       # Add the locked gems to the list of files to be indexed, grouped by their `name-version` cache key
       locked_gems&.each do |lazy_spec|
