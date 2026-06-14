@@ -2196,6 +2196,14 @@ module RubyIndexer
         end
         assert_empty(count_mismatches, "Expected the warm index to have the same entry counts as the cold index")
 
+        # The prefix tree must match too. Singleton classes are kept out of it during indexing (added with
+        # `skip_prefix_tree`), so loading them from the cache must do the same; otherwise warm would have extra
+        # `<Class:...>` leaves leaking into completion and workspace symbol results
+        cold_tree = cold.instance_variable_get(:@entries_tree)
+        warm_tree = warm.instance_variable_get(:@entries_tree)
+        assert_equal(cold_tree.search("").length, warm_tree.search("").length)
+        assert_equal(cold_tree.search("Prism").length, warm_tree.search("Prism").length)
+
         # A bundled gem's constants must be present and point at the gem's installed files
         prism_entries = warm["Prism"] #: as !nil
         refute_nil(prism_entries)

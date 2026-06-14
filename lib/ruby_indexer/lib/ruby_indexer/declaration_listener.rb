@@ -15,14 +15,17 @@ module RubyIndexer
       @uri = uri
       @enhancements = Enhancement.all(self) #: Array[Enhancement]
       @visibility_stack = [VisibilityScope.public_scope] #: Array[VisibilityScope]
-      @comments_by_line = parse_result.comments.to_h do |c|
-        [c.location.start_line, c]
-      end #: Hash[Integer, Prism::Comment]
+      @parse_result = parse_result #: (Prism::ParseLexResult | Prism::ParseResult)
+
+      # The comments by line and source lines are only used when collecting comments, which does not happen during bulk
+      # indexing (`collect_comments: false`). They are built lazily to avoid allocating a hash of every comment and an
+      # array of every source line for each file that is indexed
+      @comments_by_line = nil #: Hash[Integer, Prism::Comment]?
       @inside_def = false #: bool
       @code_units_cache = parse_result
         .code_units_cache(@index.configuration.encoding) #: (^(Integer arg0) -> Integer | Prism::CodeUnitsCache)
 
-      @source_lines = parse_result.source.lines #: Array[String]
+      @source_lines = nil #: Array[String]?
 
       # The nesting stack we're currently inside. Used to determine the fully qualified name of constants, but only
       # stored by unresolved aliases which need the original nesting to be lazily resolved
@@ -733,6 +736,20 @@ module RubyIndexer
       )
     end
 
+    # Lazily builds a map of line number to the comment that starts on that line. Only used when collecting comments
+    #: -> Hash[Integer, Prism::Comment]
+    def comments_by_line
+      @comments_by_line ||= @parse_result.comments.to_h do |c|
+        [c.location.start_line, c]
+      end
+    end
+
+    # Lazily splits the source into lines. Only used when collecting comments
+    #: -> Array[String]
+    def source_lines
+      @source_lines ||= @parse_result.source.lines
+    end
+
     #: (Prism::Node node) -> String?
     def collect_comments(node)
       return unless @collect_comments
@@ -742,7 +759,7 @@ module RubyIndexer
       start_line = node.location.start_line - 1
       start_line -= 1 unless comment_exists_at?(start_line)
       start_line.downto(1) do |line|
-        comment = @comments_by_line[line]
+        comment = comments_by_line[line]
         break unless comment
 
         # a trailing comment from a previous line is not a comment for this node
@@ -766,7 +783,7 @@ module RubyIndexer
 
     #: (Integer line) -> bool
     def comment_exists_at?(line)
-      @comments_by_line.key?(line) || !@source_lines[line - 1].to_s.strip.empty?
+      comments_by_line.key?(line) || !source_lines[line - 1].to_s.strip.empty?
     end
 
     #: (String name) -> String

@@ -138,16 +138,24 @@ module RubyIndexer
     def add(entry, skip_prefix_tree: false)
       name = entry.name
 
-      (@entries[name] ||= []) << entry
+      entries = @entries[name]
+
+      if entries
+        entries << entry
+      else
+        entries = [entry]
+        @entries[name] = entries
+
+        # The prefix tree stores the array of entries for a given name. Since that array is mutated in place as more
+        # entries with the same name are added, we only need to insert it into the tree the first time the name is seen.
+        # Re-inserting on every subsequent entry would re-walk the trie and allocate a string per character for no
+        # benefit. A given name is either always inserted (regular entries) or never inserted (singleton classes, which
+        # always pass `skip_prefix_tree`), so this stays consistent
+        @entries_tree.insert(name, entries) unless skip_prefix_tree
+      end
+
       (@uris_to_entries[entry.uri.to_s] ||= []) << entry
       @entries_recording&.push(entry)
-
-      unless skip_prefix_tree
-        @entries_tree.insert(
-          name,
-          @entries[name], #: as !nil
-        )
-      end
     end
 
     #: (String fully_qualified_name) -> Array[Entry]?
@@ -519,7 +527,11 @@ module RubyIndexer
         # The cached entries reference a Configuration object that was deserialized from disk. Replace it with the live
         # configuration so that lazy operations (such as parsing comments) use the current settings
         entry.instance_variable_set(:@configuration, @configuration)
-        add(entry)
+
+        # Singleton classes are kept out of the prefix tree during normal indexing (they are added with
+        # `skip_prefix_tree`), so we must do the same when loading them from the cache. Otherwise their `<Class:...>`
+        # names would leak into completion and workspace symbol results
+        add(entry, skip_prefix_tree: entry.is_a?(Entry::SingletonClass))
       end
 
       uris.each do |uri|
