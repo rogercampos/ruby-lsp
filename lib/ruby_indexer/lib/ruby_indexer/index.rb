@@ -480,9 +480,9 @@ module RubyIndexer
       # to break out of the nested iteration without aborting the whole method, so that we still mark indexing as
       # completed afterwards
       catch(:stop_indexing) do
-        # Index the project's own files and default gems, which are never cached
-        (grouped_uris[nil] || []).each do |uri|
-          index_file(uri, collect_comments: false)
+        # Index the project's own files using the project snapshot: unchanged files are loaded from the cache and only
+        # changed or new files are re-parsed
+        index_project_files(cache, grouped_uris[nil] || []) do
           throw(:stop_indexing) unless report_progress.call(1)
         end
 
@@ -505,9 +505,48 @@ module RubyIndexer
       end
     end
 
+    # Indexes the project's own files using a per-file snapshot. A file whose fingerprint (mtime and size) matches the
+    # snapshot has its entries loaded from the cache; any new or changed file is re-parsed. Deleted files simply drop
+    # out of the rewritten snapshot. An optional block is invoked once per file to drive progress reporting
+    #: (IndexCache cache, Array[URI::Generic] uris) ?{ () -> void } -> void
+    def index_project_files(cache, uris, &block)
+      previous_snapshot = cache.read_project_snapshot
+      current_snapshot = {} #: Hash[String, untyped]
+
+      uris.each do |uri|
+        path = uri.full_path
+        next unless path
+
+        stat = begin
+          File.stat(path)
+        rescue SystemCallError
+          nil
+        end
+
+        if stat
+          fingerprint = [stat.mtime.to_f, stat.size]
+          cached = previous_snapshot&.[](path)
+
+          if cached && cached[:fingerprint] == fingerprint
+            # Unchanged file: reuse the cached entries instead of parsing
+            load_cached_entries(cached[:entries], [uri])
+            current_snapshot[path] = cached
+          else
+            # New or changed file: parse it and capture the entries it produces for the snapshot
+            entries = record_entries { index_file(uri, collect_comments: false) }
+            current_snapshot[path] = { fingerprint: fingerprint, entries: entries }
+          end
+        end
+
+        block&.call
+      end
+
+      cache.write_project_snapshot(current_snapshot)
+    end
+
     # Records and returns every entry added to the index while the given block runs. This captures the complete set of
-    # entries produced by indexing a gem, including lazily created singleton classes whose URI may point at a different
-    # file (see `existing_or_new_singleton_class`)
+    # entries produced by indexing a gem or a file, including lazily created singleton classes whose URI may point at a
+    # different file (see `existing_or_new_singleton_class`)
     #: () { () -> void } -> Array[Entry]
     def record_entries(&block)
       recording = [] #: Array[Entry]

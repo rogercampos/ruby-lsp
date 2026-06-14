@@ -4,19 +4,26 @@
 require "fileutils"
 
 module RubyIndexer
-  # Persists the index entries of bundled gems to disk so that subsequent server starts can load them instead of
-  # re-parsing every gem file. A gem's files only change when its version changes, so each cache file is keyed by the
-  # gem's `name-version` and stays valid until the gem is upgraded.
+  # Persists index entries to disk so that subsequent server starts can load them instead of re-parsing files.
+  #
+  # Gems are cached one file per gem (keyed by `name-version`), since a gem's files only change when its version
+  # changes. The project's own files are cached in a single project snapshot keyed per file by a fingerprint (mtime and
+  # size), so that on a warm start only the files that actually changed are re-parsed.
   #
   # Entries are serialized with `Marshal`, which round-trips the entire entry graph (preserving shared `owner`
-  # references within a gem) in a single dump. The cache is always local and is invalidated whenever the schema version
-  # or the Ruby version changes, since `Marshal`'s format is tied to the Ruby version that produced it.
+  # references) in a single dump. The cache is always local and is invalidated whenever the schema version or the Ruby
+  # version changes, since `Marshal`'s format is tied to the Ruby version that produced it.
   class IndexCache
     # Bump this whenever the structure of any serialized entry changes, so that stale caches produced by an older
     # version of the Ruby LSP are discarded instead of loaded
     SCHEMA_VERSION = 1 #: Integer
 
     EXTENSION = ".dump" #: String
+
+    # Reserved cache key for the project snapshot (the index entries of the project's own files). Unlike gems, project
+    # files change individually, so the snapshot stores per-file entries plus a fingerprint (mtime and size) used to
+    # detect which files changed since the last run
+    PROJECT_SNAPSHOT_KEY = "__project__" #: String
 
     #: (String cache_dir) -> void
     def initialize(cache_dir)
@@ -69,6 +76,47 @@ module RubyIndexer
       @available = false
     end
 
+    # Reads the project snapshot, returning a hash of `{ file_path => { stat: [mtime, size], entries: [...] } }`, or
+    # `nil` if there's no valid snapshot (missing, different schema or Ruby version, or corrupted)
+    #: -> Hash[String, untyped]?
+    def read_project_snapshot
+      return unless @available
+
+      path = file_path(PROJECT_SNAPSHOT_KEY)
+      return unless File.exist?(path)
+
+      payload = Marshal.load(File.binread(path)) #: untyped
+
+      unless payload.is_a?(Hash) &&
+          payload[:schema_version] == SCHEMA_VERSION &&
+          payload[:ruby_version] == RUBY_VERSION
+        return
+      end
+
+      payload[:files]
+    rescue StandardError => e
+      warn("Ruby LSP failed to read project index snapshot: #{e.message}")
+      delete(PROJECT_SNAPSHOT_KEY)
+      nil
+    end
+
+    # Persists the project snapshot. `files` maps each file path to its fingerprint and entries. Write failures are
+    # swallowed so that they never interrupt indexing
+    #: (Hash[String, untyped] files) -> void
+    def write_project_snapshot(files)
+      return unless ensure_cache_dir
+
+      payload = { schema_version: SCHEMA_VERSION, ruby_version: RUBY_VERSION, files: files }
+      path = file_path(PROJECT_SNAPSHOT_KEY)
+      tmp_path = "#{path}.#{Process.pid}.tmp"
+
+      File.binwrite(tmp_path, Marshal.dump(payload))
+      File.rename(tmp_path, path)
+    rescue StandardError => e
+      warn("Ruby LSP failed to write project index snapshot: #{e.message}")
+      @available = false
+    end
+
     # Deletes any cache files that aren't part of the current set of valid keys, preventing the cache directory from
     # growing unbounded as gems are upgraded
     #: (Array[String] valid_keys) -> void
@@ -77,6 +125,9 @@ module RubyIndexer
 
       Dir.glob(File.join(@cache_dir, "*#{EXTENSION}")).each do |path|
         key = File.basename(path, EXTENSION)
+        # The project snapshot is managed separately and must never be pruned here
+        next if key == PROJECT_SNAPSHOT_KEY
+
         File.delete(path) unless valid_keys.include?(key)
       end
     rescue StandardError => e

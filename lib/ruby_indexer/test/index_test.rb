@@ -2165,6 +2165,70 @@ module RubyIndexer
       end
     end
 
+    def test_project_snapshot_reuses_entries_when_a_file_is_unchanged
+      Dir.mktmpdir do |work|
+        Dir.mktmpdir do |cache_dir|
+          file = File.join(work, "a.rb")
+          File.write(file, "class A\nend\n")
+          stat = File.stat(file)
+          uris = [URI::Generic.from_path(path: file)]
+
+          cold = Index.new
+          cold.enable_cache(cache_dir)
+          cold.send(:index_project_files, cold.instance_variable_get(:@cache), uris)
+          refute_nil(cold["A"])
+          assert_path_exists(File.join(cache_dir, "__project__.dump"))
+
+          # Rewrite with different content of the same size and restore the original mtime, so the file's fingerprint
+          # (mtime + size) is unchanged. The snapshot must reuse the cached entries instead of re-parsing
+          File.write(file, "class Z\nend\n")
+          File.utime(stat.atime, stat.mtime, file)
+          assert_equal(stat.size, File.stat(file).size)
+
+          warm = Index.new
+          warm.enable_cache(cache_dir)
+          warm.send(:index_project_files, warm.instance_variable_get(:@cache), uris)
+
+          refute_nil(warm["A"], "expected the cached entry to be reused")
+          assert_nil(warm["Z"], "expected the file not to be re-parsed when its fingerprint is unchanged")
+        end
+      end
+    end
+
+    def test_project_snapshot_reindexes_changed_added_and_deleted_files
+      Dir.mktmpdir do |work|
+        Dir.mktmpdir do |cache_dir|
+          a = File.join(work, "a.rb")
+          b = File.join(work, "b.rb")
+          c = File.join(work, "c.rb")
+          File.write(a, "class A\nend\n")
+          File.write(b, "class B\nend\n")
+          File.write(c, "class C\nend\n")
+          uris = ->(paths) { paths.map { |p| URI::Generic.from_path(path: p) } }
+
+          cold = Index.new
+          cold.enable_cache(cache_dir)
+          cold.send(:index_project_files, cold.instance_variable_get(:@cache), uris.call([a, b, c]))
+          assert(["A", "B", "C"].all? { |name| cold[name] })
+
+          # Change b (its size differs), delete c, add d
+          File.write(b, "class B\n  def hello; end\nend\n")
+          File.delete(c)
+          d = File.join(work, "d.rb")
+          File.write(d, "class D\nend\n")
+
+          updated = Index.new
+          updated.enable_cache(cache_dir)
+          updated.send(:index_project_files, updated.instance_variable_get(:@cache), uris.call([a, b, d]))
+
+          refute_nil(updated["A"], "unchanged file should remain indexed")
+          refute_nil(updated["D"], "new file should be indexed")
+          assert_nil(updated["C"], "deleted file should be dropped")
+          refute_nil(updated.resolve_method("hello", "B"), "changed file should reflect its new method")
+        end
+      end
+    end
+
     def test_index_all_caches_gems_and_reproduces_the_index
       Dir.mktmpdir do |cache_dir|
         # Cold run: parses every gem file and writes a cache for each bundled and default gem

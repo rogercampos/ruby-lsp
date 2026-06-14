@@ -139,6 +139,44 @@ module RubyIndexer
       refute_path_exists(File.join(cache_dir, "bar-1.0.0.dump"))
     end
 
+    def test_project_snapshot_round_trips
+      entries = index_entries("class Bar\nend\n")
+      path = @uri.full_path #: as !nil
+      @cache.write_project_snapshot({ path => { fingerprint: [123.0, 45], entries: entries } })
+
+      loaded = IndexCache.new(File.join(@dir, "cache")).read_project_snapshot
+      refute_nil(loaded)
+      loaded = loaded #: as !nil
+
+      record = loaded[path]
+      refute_nil(record)
+      assert_equal([123.0, 45], record[:fingerprint])
+      assert_equal(entries.map(&:name), record[:entries].map(&:name))
+    end
+
+    def test_project_snapshot_schema_mismatch_is_a_miss
+      @cache.write_project_snapshot({ "x.rb" => { fingerprint: [1.0, 2], entries: [] } })
+
+      path = File.join(@dir, "cache", "__project__.dump")
+      payload = Marshal.load(File.binread(path)) #: as Hash[Symbol, untyped]
+      payload[:schema_version] = IndexCache::SCHEMA_VERSION + 1
+      File.binwrite(path, Marshal.dump(payload))
+
+      assert_nil(@cache.read_project_snapshot)
+    end
+
+    def test_prune_preserves_the_project_snapshot
+      @cache.write("foo-1.0.0", index_entries("class Bar; end"))
+      @cache.write_project_snapshot({ "x.rb" => { fingerprint: [1.0, 2], entries: [] } })
+
+      # Prune with no valid gem keys: the gem cache goes away, but the project snapshot is left untouched
+      @cache.prune!([])
+
+      cache_dir = File.join(@dir, "cache")
+      refute_path_exists(File.join(cache_dir, "foo-1.0.0.dump"))
+      assert_path_exists(File.join(cache_dir, "__project__.dump"))
+    end
+
     private
 
     #: (String source) -> Array[Entry]
