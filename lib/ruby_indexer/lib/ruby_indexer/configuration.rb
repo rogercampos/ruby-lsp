@@ -57,6 +57,16 @@ module RubyIndexer
 
     #: -> Array[URI::Generic]
     def indexable_uris
+      indexable_uris_grouped_by_cache_key.values.flatten
+    end
+
+    # Returns the URIs that should be indexed, grouped by a cache key. URIs that should not be cached (the project's own
+    # files and default gems, which change frequently or are tied to the Ruby version) are grouped under the `nil` key.
+    # Each bundled gem's URIs are grouped under a `"<name>-<version>"` key so that the index entries produced from those
+    # files can be cached on disk and reused across server starts, since a gem's files only change when its version
+    # changes
+    #: -> Hash[String?, Array[URI::Generic]]
+    def indexable_uris_grouped_by_cache_key
       excluded_gems = @excluded_gems - @included_gems
       locked_gems = Bundler.locked_gems&.specs
 
@@ -137,7 +147,18 @@ module RubyIndexer
         end
       end
 
-      # Add the locked gems to the list of files to be indexed
+      uris.uniq!(&:to_s)
+
+      # The project's own files and default gems are not cached. They are grouped under the `nil` key
+      grouped_uris = { nil => uris } #: Hash[String?, Array[URI::Generic]]
+
+      # Keep track of every URI we've already grouped so that the same file never ends up in more than one group. This
+      # preserves the previous de-duplication behavior where the project's files (added first) take precedence over a
+      # gem's installed files, which matters when BUNDLE_PATH points to a directory inside the project
+      seen = {} #: Hash[String, bool]
+      uris.each { |uri| seen[uri.to_s] = true }
+
+      # Add the locked gems to the list of files to be indexed, grouped by their `name-version` cache key
       locked_gems&.each do |lazy_spec|
         next if excluded_gems.include?(lazy_spec.name)
 
@@ -148,22 +169,31 @@ module RubyIndexer
         # duplicates or accidentally ignoring exclude patterns
         next if spec.full_gem_path == @workspace_path
 
-        uris.concat(
-          spec.require_paths.flat_map do |require_path|
-            load_path_entry = File.join(spec.full_gem_path, require_path)
-            Dir.glob(File.join(load_path_entry, "**", "*.rb")).map! do |path|
-              URI::Generic.from_path(path: path, load_path_entry: load_path_entry)
-            end
-          end,
-        )
+        gem_uris = spec.require_paths.flat_map do |require_path|
+          load_path_entry = File.join(spec.full_gem_path, require_path)
+          Dir.glob(File.join(load_path_entry, "**", "*.rb")).map! do |path|
+            URI::Generic.from_path(path: path, load_path_entry: load_path_entry)
+          end
+        end
+
+        gem_uris.reject! do |uri|
+          key = uri.to_s
+          next true if seen[key]
+
+          seen[key] = true
+          false
+        end
+
+        next if gem_uris.empty?
+
+        (grouped_uris["#{spec.name}-#{spec.version}"] ||= []).concat(gem_uris)
       rescue Gem::MissingSpecError
         # If a gem is scoped only to some specific platform, then its dependencies may not be installed either, but they
         # are still listed in locked_gems. We can't index them because they are not installed for the platform, so we
         # just ignore if they're missing
       end
 
-      uris.uniq!(&:to_s)
-      uris
+      grouped_uris
     end
 
     #: -> Regexp

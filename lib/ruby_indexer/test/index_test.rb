@@ -2165,6 +2165,68 @@ module RubyIndexer
       end
     end
 
+    def test_index_all_caches_bundled_gems_and_reproduces_the_index
+      Dir.mktmpdir do |cache_dir|
+        # Cold run: parses every gem file and writes a cache for each bundled gem
+        cold = Index.new
+        cold.enable_cache(cache_dir)
+        cold.index_all
+
+        cache_files = Dir.glob(File.join(cache_dir, "*.dump"))
+        refute_empty(cache_files, "Expected the cold run to write gem cache files")
+        prism_spec = Gem::Specification.find_by_name("prism")
+        assert_path_exists(File.join(cache_dir, "prism-#{prism_spec.version}.dump"))
+
+        # Warm run: loads bundled gem entries from the cache instead of re-parsing them
+        warm = Index.new
+        warm.enable_cache(cache_dir)
+        warm.index_all
+
+        cold_entries = cold.instance_variable_get(:@entries)
+        warm_entries = warm.instance_variable_get(:@entries)
+
+        # The warm index must contain exactly the same constants as the cold one
+        assert_equal(cold_entries.keys.sort, warm_entries.keys.sort)
+
+        # And the same number of entries for each constant, so that no entry is dropped or duplicated
+        count_mismatches = cold_entries.filter_map do |name, entries|
+          warm_count = warm_entries[name]&.length || 0
+          name if entries.length != warm_count
+        end
+        assert_empty(count_mismatches, "Expected the warm index to have the same entry counts as the cold index")
+
+        # A bundled gem's constants must be present and point at the gem's installed files
+        prism_entries = warm["Prism"] #: as !nil
+        refute_nil(prism_entries)
+        assert(prism_entries.any? { |entry| entry.uri.full_path&.start_with?(prism_spec.full_gem_path) })
+      end
+    end
+
+    def test_index_all_loaded_from_cache_preserves_method_owners
+      Dir.mktmpdir do |cache_dir|
+        Index.new.tap { |i| i.enable_cache(cache_dir) }.index_all
+
+        warm = Index.new
+        warm.enable_cache(cache_dir)
+        warm.index_all
+
+        prism_path = Gem::Specification.find_by_name("prism").full_gem_path
+
+        # Find a method that was defined in the prism gem and loaded from the cache
+        method = warm.instance_variable_get(:@entries).values.flatten.find do |entry|
+          entry.is_a?(Entry::Method) && entry.owner && entry.uri.full_path&.start_with?(prism_path)
+        end #: as Entry::Method?
+        refute_nil(method, "Expected to find a cached prism method with an owner")
+        method = method #: as !nil
+        owner = method.owner #: as !nil
+
+        # The owner reference must point at the very same object stored under the owner's name in the index, proving
+        # that object identity was preserved through serialization
+        owner_entries = warm[owner.name] #: as !nil
+        assert_includes(owner_entries, owner)
+      end
+    end
+
     def test_index_can_handle_entries_from_untitled_scheme
       uri = URI("untitled:Untitled-1")
 

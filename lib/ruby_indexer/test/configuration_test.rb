@@ -114,6 +114,32 @@ module RubyIndexer
       assert_equal(uris.uniq.length, uris.length)
     end
 
+    def test_indexable_uris_grouped_by_cache_key
+      grouped = @config.indexable_uris_grouped_by_cache_key
+
+      # The project's own files and default gems are grouped under the `nil` key
+      non_cached_paths = grouped[nil].map(&:full_path)
+      assert_includes(non_cached_paths, "#{RbConfig::CONFIG["rubylibdir"]}/pathname.rb")
+      assert(non_cached_paths.any? { |path| path.start_with?(File.join(Dir.pwd, "lib")) })
+
+      # Bundled gems are grouped under a `name-version` cache key
+      prism_spec = Gem::Specification.find_by_name("prism")
+      cache_key = "prism-#{prism_spec.version}"
+
+      assert_includes(grouped.keys, cache_key)
+      assert(
+        grouped.fetch(cache_key).all? { |uri| uri.full_path.start_with?(prism_spec.full_gem_path) },
+        "Expected all prism URIs to live inside the prism gem path",
+      )
+
+      # Cache keys never overlap: a URI belongs to exactly one group
+      all_uris = grouped.values.flatten.map(&:to_s)
+      assert_equal(all_uris.uniq.length, all_uris.length)
+
+      # Flattening the grouped URIs is equivalent to the flat `indexable_uris` list
+      assert_equal(@config.indexable_uris.map(&:to_s).sort, all_uris.sort)
+    end
+
     def test_configuration_raises_for_unknown_keys
       assert_raises(ArgumentError) do
         @config.apply_config({ "unknown_config" => 123 })

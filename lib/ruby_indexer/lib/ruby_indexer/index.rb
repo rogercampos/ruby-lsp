@@ -79,7 +79,23 @@ module RubyIndexer
 
       @configuration = RubyIndexer::Configuration.new #: Configuration
 
+      # Optional on-disk cache for the index entries of bundled gems. It remains `nil` (caching disabled) until
+      # `enable_cache` is called, which only happens in the running server and never during tests
+      @cache = nil #: IndexCache?
+
+      # When set to an array, every entry added to the index is also appended here. This is used to capture exactly the
+      # entries produced while indexing a single gem, including lazily created entries (such as singleton classes) that
+      # may be attached to a URI belonging to a different file
+      @entries_recording = nil #: Array[Entry]?
+
       @initial_indexing_completed = false #: bool
+    end
+
+    # Enables caching the index entries of bundled gems under the given directory. Once enabled, `index_all` will load a
+    # gem's entries from the cache instead of re-parsing its files when a valid cache exists
+    #: (String cache_dir) -> void
+    def enable_cache(cache_dir)
+      @cache = IndexCache.new(cache_dir)
     end
 
     # Register an included `hook` that will be executed when `module_name` is included into any namespace
@@ -124,6 +140,7 @@ module RubyIndexer
 
       (@entries[name] ||= []) << entry
       (@uris_to_entries[entry.uri.to_s] ||= []) << entry
+      @entries_recording&.push(entry)
 
       unless skip_prefix_tree
         @entries_tree.insert(
@@ -353,8 +370,12 @@ module RubyIndexer
     # Index all files for the given URIs, which defaults to what is configured. A block can be used to track and control
     # indexing progress. That block is invoked with the current progress percentage and should return `true` to continue
     # indexing or `false` to stop indexing.
-    #: (?uris: Array[URI::Generic]) ?{ (Integer progress) -> bool } -> void
-    def index_all(uris: @configuration.indexable_uris, &block)
+    #
+    # When `uris` is not provided and a cache has been enabled (see `enable_cache`), the index entries of bundled gems
+    # are loaded from disk when available and persisted otherwise, which significantly speeds up indexing. When `uris`
+    # is provided explicitly or caching is disabled, every file is parsed normally.
+    #: (?uris: Array[URI::Generic]?) ?{ (Integer progress) -> bool } -> void
+    def index_all(uris: nil, &block)
       # When troubleshooting an indexing issue, e.g. through irb, it's not obvious that `index_all` will augment the
       # existing index values, meaning it may contain 'stale' entries. This check ensures that the user is aware of this
       # behavior and can take appropriate action.
@@ -364,16 +385,12 @@ module RubyIndexer
       end
 
       RBSIndexer.new(self).index_ruby_core
-      # Calculate how many paths are worth 1% of progress
-      progress_step = (uris.length / 100.0).ceil
 
-      uris.each_with_index do |uri, index|
-        if block && index % progress_step == 0
-          progress = (index / progress_step) + 1
-          break unless block.call(progress)
-        end
-
-        index_file(uri, collect_comments: false)
+      cache = @cache
+      if uris.nil? && cache
+        index_all_with_cache(cache, &block)
+      else
+        index_uris(uris || @configuration.indexable_uris, &block)
       end
 
       @initial_indexing_completed = true
@@ -408,6 +425,107 @@ module RubyIndexer
     rescue Errno::EISDIR, Errno::ENOENT
       # If `path` is a directory, just ignore it and continue indexing. If the file doesn't exist, then we also ignore
       # it
+    end
+
+    # Indexes the given flat list of URIs by parsing each file. A block can be used to track and control progress in the
+    # same way as `index_all`
+    #: (Array[URI::Generic] uris) ?{ (Integer progress) -> bool } -> void
+    def index_uris(uris, &block)
+      # Calculate how many paths are worth 1% of progress
+      progress_step = (uris.length / 100.0).ceil
+
+      uris.each_with_index do |uri, index|
+        if block && index % progress_step == 0
+          progress = (index / progress_step) + 1
+          break unless block.call(progress)
+        end
+
+        index_file(uri, collect_comments: false)
+      end
+    end
+
+    # Indexes all configured URIs, loading the entries of bundled gems from the cache when available and writing a fresh
+    # cache for gems that had to be parsed. Stale cache files (from gems that are no longer part of the bundle) are
+    # pruned at the end
+    #: (IndexCache cache) ?{ (Integer progress) -> bool } -> void
+    def index_all_with_cache(cache, &block)
+      grouped_uris = @configuration.indexable_uris_grouped_by_cache_key
+      total = grouped_uris.values.sum(&:length)
+      # Calculate how many paths are worth 1% of progress
+      progress_step = (total / 100.0).ceil
+      indexed = 0 #: Integer
+
+      # Advances the progress counter by `count` files and reports the new percentage when crossing a 1% boundary.
+      # Returns `false` if the block requested that indexing stops
+      report_progress = lambda do |count|
+        previous = indexed
+        indexed += count
+        next true unless block && progress_step > 0
+        next true if previous / progress_step == indexed / progress_step
+
+        progress = indexed / progress_step
+        progress = 100 if progress > 100
+        block.call(progress)
+      end
+
+      # The block may request that we stop indexing (for example when the server is shutting down). We use throw/catch
+      # to break out of the nested iteration without aborting the whole method, so that we still mark indexing as
+      # completed afterwards
+      catch(:stop_indexing) do
+        # Index the project's own files and default gems, which are never cached
+        (grouped_uris[nil] || []).each do |uri|
+          index_file(uri, collect_comments: false)
+          throw(:stop_indexing) unless report_progress.call(1)
+        end
+
+        grouped_uris.each do |cache_key, uris|
+          next if cache_key.nil?
+
+          cached_entries = cache.read(cache_key)
+
+          if cached_entries
+            load_cached_entries(cached_entries, uris)
+          else
+            gem_entries = record_entries { uris.each { |uri| index_file(uri, collect_comments: false) } }
+            cache.write(cache_key, gem_entries)
+          end
+
+          throw(:stop_indexing) unless report_progress.call(uris.length)
+        end
+
+        cache.prune!(grouped_uris.keys.compact)
+      end
+    end
+
+    # Records and returns every entry added to the index while the given block runs. This captures the complete set of
+    # entries produced by indexing a gem, including lazily created singleton classes whose URI may point at a different
+    # file (see `existing_or_new_singleton_class`)
+    #: () { () -> void } -> Array[Entry]
+    def record_entries(&block)
+      recording = [] #: Array[Entry]
+      @entries_recording = recording
+      block.call
+      recording
+    ensure
+      @entries_recording = nil
+    end
+
+    # Inserts the given cached entries into the index as if they had been parsed from disk, populating the same internal
+    # structures that `index_single` would. The require paths for every gem URI are inserted too, so that requirable
+    # files that produced no entries are still available for require autocompletion
+    #: (Array[Entry] entries, Array[URI::Generic] uris) -> void
+    def load_cached_entries(entries, uris)
+      entries.each do |entry|
+        # The cached entries reference a Configuration object that was deserialized from disk. Replace it with the live
+        # configuration so that lazy operations (such as parsing comments) use the current settings
+        entry.instance_variable_set(:@configuration, @configuration)
+        add(entry)
+      end
+
+      uris.each do |uri|
+        require_path = uri.require_path
+        @require_paths_tree.insert(require_path, uri) if require_path
+      end
     end
 
     # Follows aliases in a namespace. The algorithm keeps checking if the name is an alias and then recursively follows

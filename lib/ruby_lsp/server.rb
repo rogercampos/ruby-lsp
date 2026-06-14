@@ -1242,6 +1242,13 @@ module RubyLsp
 
     #: -> void
     def perform_initial_indexing
+      # Enable caching the index entries of bundled gems to disk so that subsequent server starts can load them instead
+      # of re-parsing every gem file. We skip this in tests to avoid polluting the workspace and to keep the indexing
+      # behavior deterministic
+      unless @test_mode
+        @global_state.index.enable_cache(File.join(@global_state.workspace_path, ".ruby-lsp", ".index_cache"))
+      end
+
       # The begin progress invocation happens during `initialize`, so that the notification is sent before we are
       # stuck indexing files
       Thread.new do
